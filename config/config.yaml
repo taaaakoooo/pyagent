@@ -1,0 +1,22 @@
+llm:
+  provider: dashscope
+  api_base: "https://dashscope.aliyuncs.com/compatible-mode/v1"
+  model: "qwen3-32b"
+  api_key_env: "DASHSCOPE_API_KEY"
+  fallback_api_key_envs:
+    - "OPENAI_API_KEY"
+  timeout_seconds: 180
+  stream: true
+
+agent:
+  max_turns: 15
+  workspace_root: "."
+
+token_usage:
+  context_window: 128000
+  max_session_tokens: null
+  warning_threshold: 0.7
+  warn_once: true
+
+session:
+  storage_dir: ".sessions"
