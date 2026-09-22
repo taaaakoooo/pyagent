@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from functools import partial
 from pathlib import Path
-from typing import Any, Callable, Dict, List
+from typing import Any, Callable, Dict, List, Optional
 
 from internal.diff.diff import ToolExecutorResult
 from internal.tools.definitions import TOOL_NAMES, build_all_definitions
@@ -22,6 +22,24 @@ class ToolRegistry:
         self._definitions: Dict[str, ToolDefinition] = {}
         self._handlers: Dict[str, ToolHandler] = {}
         self._registration_order: List[str] = []
+        self._tool_context: Optional[ToolContext] = None
+
+    @property
+    def tool_context(self) -> Optional[ToolContext]:
+        return self._tool_context
+
+    def set_tool_context(self, context: ToolContext) -> None:
+        """Bind local tool executors to ``context``, registering any missing ones."""
+        self._tool_context = context
+        for definition in build_all_definitions():
+            executor = EXECUTOR_MAP.get(definition.name)
+            if executor is None:
+                continue
+            handler = partial(executor, ctx=context)
+            if definition.name in self._definitions:
+                self._handlers[definition.name] = handler
+            else:
+                self.register(definition, handler)
 
     def register(
         self,
@@ -112,12 +130,7 @@ def create_default_tool_registry(
         workspace_root=resolved_workspace,
         tool_output_path=resolved_tool_output,
     )
-
-    for definition in build_all_definitions():
-        executor = EXECUTOR_MAP.get(definition.name)
-        if executor is None:
-            continue
-        registry.register(definition, partial(executor, ctx=context))
+    registry.set_tool_context(context)
 
     return registry
 

@@ -42,13 +42,46 @@ class LLMStreamError(LLMError):
     """Raised when SSE parsing fails or a line exceeds the size limit."""
 
 
+def _extract_api_error_message(body: str) -> str:
+    """Pull the human-readable reason out of a provider error body."""
+    if not body:
+        return ""
+    try:
+        payload = json.loads(body)
+    except (json.JSONDecodeError, TypeError):
+        return body.strip()[:200]
+
+    if not isinstance(payload, dict):
+        return ""
+
+    error = payload.get("error")
+    if isinstance(error, dict):
+        message = error.get("message")
+        if isinstance(message, str) and message:
+            return message.strip()[:200]
+        code = error.get("code")
+        if isinstance(code, str) and code:
+            return code
+    if isinstance(error, str) and error:
+        return error.strip()[:200]
+
+    message = payload.get("message")
+    if isinstance(message, str) and message:
+        return message.strip()[:200]
+    return ""
+
+
 class LLMHTTPError(LLMError):
     """Raised for non-retryable HTTP failures."""
 
     def __init__(self, status: int, message: str, body: str = "") -> None:
         self.status = status
         self.body = body
-        super().__init__(f"HTTP {status}: {message}")
+        self.api_message = _extract_api_error_message(body)
+        detail = f"HTTP {status}: {message}"
+        if self.api_message:
+            detail = f"{detail} - {self.api_message}"
+        super().__init__(detail)
 
 
 class LLMRetryExhaustedError(LLMError):
@@ -252,9 +285,12 @@ class LLMClient:
             "stream_options": {"include_usage": True},
             "temperature": TEMPERATURE,
             "max_tokens": MAX_OUTPUT_TOKENS,
-            "tools": serialized_tools,
         }
+        # Omit the key entirely when there are no tools: several providers
+        # (DashScope/Qwen among them) reject an empty array with HTTP 400
+        # "[] is too short - 'tools'".
         if serialized_tools:
+            body["tools"] = serialized_tools
             body["tool_choice"] = "auto"
         return body
 
@@ -288,7 +324,7 @@ class LLMClient:
         )
 
     def _request_with_retry(self, body: Dict[str, Any], accept: str) -> Any:
-        last_error: Optional[LLMHTTPError] = None
+        last_error: Optional[LLMError] = None
 
         for attempt in range(MAX_RETRIES + 1):
             request = self._build_http_request(body, accept)
@@ -330,7 +366,17 @@ class LLMClient:
                 last_error = http_error
                 time.sleep(RETRY_BACKOFF_SECONDS[attempt])
             except urllib.error.URLError as exc:
-                raise LLMError(f"Network error: {exc.reason}") from exc
+                # Transient socket failures (flaky proxy, DNS hiccup, a local
+                # stack briefly refusing connections) surface here. Retrying
+                # with backoff turns them into a non-event instead of failing
+                # the whole turn.
+                last_error = LLMError(f"Network error: {exc.reason}")
+                if attempt >= MAX_RETRIES:
+                    raise LLMRetryExhaustedError(
+                        f"Network error after {MAX_RETRIES + 1} attempts: "
+                        f"{exc.reason}"
+                    ) from exc
+                time.sleep(RETRY_BACKOFF_SECONDS[attempt])
 
         raise LLMRetryExhaustedError(
             f"LLM request failed after {MAX_RETRIES} retries"

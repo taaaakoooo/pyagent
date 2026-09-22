@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import itertools
 import json
+import logging
 import threading
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
@@ -18,12 +19,17 @@ from internal.mcp.mcp import (
 )
 from internal.mcp.transport import (
     MCPHttpTransport,
+    MCPProtocolError,
     MCPStdioTransport,
+    MCPTimeoutError,
     MCPTransport,
+    MCPTransportError,
 )
 from internal.types.types import MCPServerConfig, ToolResult
 
 DEFAULT_CLIENT_INFO = {"name": "pyagent", "version": "0.1.0"}
+
+logger = logging.getLogger("pyagent.mcp")
 
 
 class MCPRemoteError(RuntimeError):
@@ -116,24 +122,47 @@ class MCPClient:
         params: Optional[Dict[str, Any]] = None,
     ) -> MCPResponse:
         self.ensure_started()
-        request_params = dict(params or {})
-        meta = dict(request_params.get("_meta") or {})
-        meta["io.modelcontextprotocol/protocolVersion"] = MCP_PROTOCOL_VERSION
-        meta.setdefault(
-            "io.modelcontextprotocol/clientInfo",
-            dict(self.user_config.get("client_info") or DEFAULT_CLIENT_INFO),
-        )
-        meta.setdefault(
-            "io.modelcontextprotocol/clientCapabilities",
-            dict(self.user_config.get("client_capabilities") or {}),
-        )
-        request_params["_meta"] = meta
         request = MCPRequest(
-            id=self.next_request_id(),
             method=method,
-            params=request_params,
+            params=self._build_params(params),
+            id=self.next_request_id(),
         )
         return self.transport.send(request)
+
+    def _protocol_meta(self) -> Dict[str, Any]:
+        return {
+            "io.modelcontextprotocol/protocolVersion": (
+                self.cache.protocol_version or MCP_PROTOCOL_VERSION
+            ),
+            "io.modelcontextprotocol/clientInfo": dict(
+                self.user_config.get("client_info") or DEFAULT_CLIENT_INFO
+            ),
+            "io.modelcontextprotocol/clientCapabilities": dict(
+                self.user_config.get("client_capabilities") or {}
+            ),
+        }
+
+    def _build_params(self, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        request_params = dict(params or {})
+        meta = dict(request_params.get("_meta") or {})
+        for key, value in self._protocol_meta().items():
+            meta.setdefault(key, value)
+        request_params["_meta"] = meta
+        return request_params
+
+    def send_notification(
+        self,
+        method: str,
+        params: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        """Send a JSON-RPC notification, omitting the ``id`` member."""
+        self.ensure_started()
+        request = MCPRequest(
+            method=method,
+            params=self._build_params(params),
+            id=None,
+        )
+        self.transport.notify(request)
 
     def discover_server(self) -> Dict[str, Any]:
         response = self.send_request("server/discover")
@@ -166,6 +195,51 @@ class MCPClient:
         self.cache.capabilities = dict(capabilities)
         self.cache.server_info = dict(server_info)
         self.cache.values["discover"] = dict(result)
+        self.cache.values["handshake"] = "discover"
+        return result
+
+    def initialize(self) -> Dict[str, Any]:
+        """Perform the standard MCP handshake: initialize + initialized."""
+        response = self.send_request(
+            "initialize",
+            {
+                "protocolVersion": MCP_PROTOCOL_VERSION,
+                "capabilities": dict(
+                    self.user_config.get("client_capabilities") or {}
+                ),
+                "clientInfo": dict(
+                    self.user_config.get("client_info") or DEFAULT_CLIENT_INFO
+                ),
+            },
+        )
+        result = self._require_result(response)
+
+        negotiated = result.get("protocolVersion") or MCP_PROTOCOL_VERSION
+        capabilities = result.get("capabilities")
+        if capabilities is None:
+            capabilities = {}
+        if not isinstance(capabilities, dict):
+            raise ValueError("MCP initialize capabilities must be an object")
+        server_info = result.get("serverInfo")
+        if not isinstance(server_info, dict):
+            server_info = {}
+
+        self.cache.initialized = True
+        self.cache.protocol_version = str(negotiated)
+        self.cache.capabilities = dict(capabilities)
+        self.cache.server_info = dict(server_info)
+        self.cache.values["initialize"] = dict(result)
+        self.cache.values["handshake"] = "initialize"
+
+        # Best-effort completion notification per the MCP handshake spec.
+        try:
+            self.send_notification("notifications/initialized", {})
+        except Exception as exc:  # noqa: BLE001 - notification is advisory only
+            logger.warning(
+                "MCP server '%s' rejected notifications/initialized: %s",
+                self.server_alias,
+                exc,
+            )
         return result
 
     def list_tools(self) -> List[Dict[str, Any]]:
@@ -199,9 +273,34 @@ class MCPClient:
         return tools
 
     def start_and_discover(self) -> List[Dict[str, Any]]:
+        """Handshake, then list tools.
+
+        Tries the ``server/discover`` handshake first and falls back to the
+        standard ``initialize`` handshake when the server rejects it.
+        """
         self.ensure_started()
-        self.discover_server()
+        self._handshake()
         return self.list_tools()
+
+    def _handshake(self) -> str:
+        """Negotiate the protocol, returning which handshake succeeded."""
+        try:
+            self.discover_server()
+            return "discover"
+        except MCPTimeoutError:
+            # A timeout will not be fixed by a second handshake attempt.
+            raise
+        except (MCPRemoteError, MCPProtocolError, MCPTransportError, ValueError) as exc:
+            logger.info(
+                "MCP server '%s' rejected server/discover (%s); "
+                "falling back to initialize",
+                self.server_alias,
+                exc,
+            )
+
+        self.cache.clear()
+        self.initialize()
+        return "initialize"
 
     def call_tool(
         self,

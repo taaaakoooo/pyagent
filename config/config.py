@@ -8,6 +8,8 @@ from dataclasses import dataclass, field, fields
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Type, TypeVar
 
+from internal.session.session import SessionError, validate_session_id
+
 try:
     import yaml  # type: ignore[import-untyped]
 except ImportError:  # pragma: no cover - optional dependency at runtime
@@ -42,8 +44,12 @@ def _parse_scalar(value: str) -> Any:
     value = value.strip()
     if not value:
         return ""
-    if value[0] in "\"'" and value[-1] == value[0]:
+    if value[0] in "\"'" and value[-1] == value[0] and len(value) >= 2:
         return value[1:-1]
+    if value == "[]":
+        return []
+    if value == "{}":
+        return {}
     lowered = value.lower()
     if lowered in {"null", "~"}:
         return None
@@ -56,6 +62,21 @@ def _parse_scalar(value: str) -> Any:
     if re.fullmatch(r"-?\d+\.\d+", value):
         return float(value)
     return value
+
+
+_MAPPING_KEY_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_.-]*\Z")
+
+
+def _split_mapping_item(text: str) -> Optional[tuple[str, str]]:
+    """Split ``key: value`` list items such as ``- name: fs``."""
+    key, separator, value = text.partition(":")
+    if not separator:
+        return None
+    if not _MAPPING_KEY_RE.fullmatch(key.strip()):
+        return None
+    if value and not value.startswith(" "):
+        return None
+    return key.strip(), value.strip()
 
 
 def _parse_simple_yaml(text: str) -> Dict[str, Any]:
@@ -81,7 +102,17 @@ def _parse_simple_yaml(text: str) -> Dict[str, Any]:
         if line.startswith("- "):
             if not isinstance(container, list):
                 raise ConfigError("Invalid YAML list structure")
-            container.append(_parse_scalar(line[2:]))
+            item = line[2:].strip()
+            mapping_item = _split_mapping_item(item)
+            if mapping_item is None:
+                container.append(_parse_scalar(item))
+                index += 1
+                continue
+            entry: Dict[str, Any] = {}
+            container.append(entry)
+            entry[mapping_item[0]] = _parse_scalar(mapping_item[1])
+            # Deeper lines belong to this mapping; keep it as the open container.
+            stack.append((indent, entry))
             index += 1
             continue
 
@@ -144,13 +175,13 @@ def _from_dict(cls: Type[T], data: Optional[Dict[str, Any]]) -> T:
 
 @dataclass
 class LLMConfig:
-    provider: str = "dashscope"
-    api_base: str = "https://dashscope.aliyuncs.com/compatible-mode/v1"
-    model: str = "qwen3-32b"
-    api_key_env: str = "DASHSCOPE_API_KEY"
-    fallback_api_key_envs: List[str] = field(
-        default_factory=lambda: ["OPENAI_API_KEY"]
-    )
+    provider: str = "deepseek"
+    api_base: str = "https://api.deepseek.com/v1"
+    model: str = "deepseek-v4-flash"
+    api_key_env: str = "DEEPSEEK_API_KEY"
+    # Kept empty on purpose: a fallback pointing at a different provider's key
+    # only produces confusing 401s.
+    fallback_api_key_envs: List[str] = field(default_factory=list)
     timeout_seconds: float = 180.0
     stream: bool = True
     api_key: str = field(default="", repr=False)
@@ -209,6 +240,58 @@ class TokenUsageConfig:
 @dataclass
 class SessionConfig:
     storage_dir: str = ".sessions"
+    default_id: str = "default"
+    isolate_tool_output: bool = True
+
+
+@dataclass
+class SkillConfig:
+    """Settings for keyword-routed skills."""
+
+    enabled: bool = True
+    dir: str = "skills"
+    files: List[str] = field(default_factory=list)
+    inject_system_prompt: bool = True
+    # "none" hands the model zero tools whenever no skill keyword matches,
+    # and models then invent tool-call syntax in plain text instead. Keep
+    # read-only tools available by default; mutating ones still need a match.
+    unmatched_tools: str = "readonly"
+    always_visible_sources: List[str] = field(default_factory=lambda: ["mcp"])
+
+
+SKILL_UNMATCHED_POLICIES = ("none", "all", "readonly")
+TOOL_SOURCES = ("local", "mcp")
+MCP_TRANSPORTS = ("stdio", "http", "streamable-http", "streamable_http", "sse")
+
+
+@dataclass
+class MCPServerEntry:
+    """Declarative settings for one MCP server."""
+
+    name: str
+    transport: str = "stdio"
+    command: Optional[str] = None
+    args: List[str] = field(default_factory=list)
+    env: Dict[str, str] = field(default_factory=dict)
+    cwd: Optional[str] = None
+    url: Optional[str] = None
+    headers: Dict[str, str] = field(default_factory=dict)
+    timeout_seconds: float = 60.0
+    enabled: bool = True
+
+
+@dataclass
+class MCPConfig:
+    """Settings for MCP server integration."""
+
+    enabled: bool = True
+    autostart: bool = True
+    servers: List[MCPServerEntry] = field(default_factory=list)
+
+    def enabled_servers(self) -> List[MCPServerEntry]:
+        if not self.enabled:
+            return []
+        return [server for server in self.servers if server.enabled]
 
 
 @dataclass
@@ -217,6 +300,8 @@ class AppConfig:
     agent: AgentConfig = field(default_factory=AgentConfig)
     token_usage: TokenUsageConfig = field(default_factory=TokenUsageConfig)
     session: SessionConfig = field(default_factory=SessionConfig)
+    skills: SkillConfig = field(default_factory=SkillConfig)
+    mcp: MCPConfig = field(default_factory=MCPConfig)
 
     def resolve_api_key(self) -> str:
         return self.llm.resolve_api_key()
@@ -224,6 +309,39 @@ class AppConfig:
     def validate(self) -> None:
         if self.agent.max_turns < 1:
             raise ConfigError("agent.max_turns must be >= 1")
+
+        if self.skills.unmatched_tools not in SKILL_UNMATCHED_POLICIES:
+            allowed = ", ".join(SKILL_UNMATCHED_POLICIES)
+            raise ConfigError(
+                f"skills.unmatched_tools must be one of: {allowed}"
+            )
+
+        if not isinstance(self.skills.files, list):
+            raise ConfigError("skills.files must be a list of file paths")
+
+        if not isinstance(self.skills.enabled, bool):
+            raise ConfigError("skills.enabled must be a boolean")
+
+        if not isinstance(self.skills.always_visible_sources, list):
+            raise ConfigError(
+                "skills.always_visible_sources must be a list of tool sources"
+            )
+        for source in self.skills.always_visible_sources:
+            if source not in TOOL_SOURCES:
+                allowed = ", ".join(TOOL_SOURCES)
+                raise ConfigError(
+                    f"skills.always_visible_sources entries must be one of: {allowed}"
+                )
+
+        self._validate_mcp()
+
+        if not isinstance(self.session.isolate_tool_output, bool):
+            raise ConfigError("session.isolate_tool_output must be a boolean")
+
+        try:
+            validate_session_id(self.session.default_id)
+        except SessionError as exc:
+            raise ConfigError(f"session.default_id is invalid: {exc}") from exc
 
         if not (0 < self.token_usage.warning_threshold <= 1):
             raise ConfigError("token_usage.warning_threshold must be in (0, 1]")
@@ -236,6 +354,51 @@ class AppConfig:
             and self.token_usage.max_session_tokens <= 0
         ):
             raise ConfigError("token_usage.max_session_tokens must be > 0 when set")
+
+    def _validate_mcp(self) -> None:
+        if not isinstance(self.mcp.enabled, bool):
+            raise ConfigError("mcp.enabled must be a boolean")
+        if not isinstance(self.mcp.autostart, bool):
+            raise ConfigError("mcp.autostart must be a boolean")
+        if not isinstance(self.mcp.servers, list):
+            raise ConfigError("mcp.servers must be a list of server entries")
+
+        seen_names = set()
+        for index, server in enumerate(self.mcp.servers):
+            if not isinstance(server, MCPServerEntry):
+                raise ConfigError(f"mcp.servers[{index}] must be a mapping")
+            name = (server.name or "").strip()
+            if not name:
+                raise ConfigError(f"mcp.servers[{index}].name must not be empty")
+            if name in seen_names:
+                raise ConfigError(f"mcp.servers has a duplicate name: {name}")
+            seen_names.add(name)
+
+            if not isinstance(server.enabled, bool):
+                raise ConfigError(f"mcp.servers[{index}].enabled must be a boolean")
+
+            transport = (server.transport or "").strip().lower()
+            if transport not in MCP_TRANSPORTS:
+                allowed = ", ".join(MCP_TRANSPORTS)
+                raise ConfigError(
+                    f"mcp.servers[{index}].transport must be one of: {allowed}"
+                )
+
+            if transport == "stdio" and not (server.command or "").strip():
+                raise ConfigError(
+                    f"mcp server '{name}' uses stdio and requires a command"
+                )
+            if transport != "stdio" and not (server.url or "").strip():
+                raise ConfigError(
+                    f"mcp server '{name}' uses {transport} and requires a url"
+                )
+
+            if not isinstance(server.args, list):
+                raise ConfigError(f"mcp.servers[{index}].args must be a list")
+            if server.timeout_seconds is None or server.timeout_seconds <= 0:
+                raise ConfigError(
+                    f"mcp.servers[{index}].timeout_seconds must be > 0"
+                )
 
 
 @dataclass
@@ -304,8 +467,54 @@ def _default_config_dict() -> Dict[str, Any]:
         },
         "session": {
             "storage_dir": SessionConfig.storage_dir,
+            "default_id": SessionConfig.default_id,
+            "isolate_tool_output": SessionConfig.isolate_tool_output,
+        },
+        "skills": {
+            "enabled": SkillConfig.enabled,
+            "dir": SkillConfig.dir,
+            "files": list(SkillConfig().files),
+            "inject_system_prompt": SkillConfig.inject_system_prompt,
+            "unmatched_tools": SkillConfig.unmatched_tools,
+            "always_visible_sources": list(
+                SkillConfig().always_visible_sources
+            ),
+        },
+        "mcp": {
+            "enabled": MCPConfig.enabled,
+            "autostart": MCPConfig.autostart,
+            "servers": [],
         },
     }
+
+
+def _mcp_config_from_dict(data: Optional[Dict[str, Any]]) -> MCPConfig:
+    """Build an ``MCPConfig`` including its nested server entries."""
+    if not data:
+        return MCPConfig()
+    if not isinstance(data, dict):
+        raise ConfigError("mcp must be a mapping")
+
+    raw_servers = data.get("servers")
+    if raw_servers is None:
+        raw_servers = []
+    if not isinstance(raw_servers, list):
+        raise ConfigError("mcp.servers must be a list of server entries")
+
+    servers: List[MCPServerEntry] = []
+    for index, raw in enumerate(raw_servers):
+        if not isinstance(raw, dict):
+            raise ConfigError(f"mcp.servers[{index}] must be a mapping")
+        try:
+            servers.append(_from_dict(MCPServerEntry, raw))
+        except TypeError as exc:
+            raise ConfigError(f"Invalid mcp.servers[{index}]: {exc}") from exc
+
+    return MCPConfig(
+        enabled=data.get("enabled", MCPConfig.enabled),
+        autostart=data.get("autostart", MCPConfig.autostart),
+        servers=servers,
+    )
 
 
 def load_config(path: Optional[str] = None, resolve_key: bool = True) -> AppConfig:
@@ -319,6 +528,8 @@ def load_config(path: Optional[str] = None, resolve_key: bool = True) -> AppConf
         agent=_from_dict(AgentConfig, merged.get("agent")),
         token_usage=_from_dict(TokenUsageConfig, merged.get("token_usage")),
         session=_from_dict(SessionConfig, merged.get("session")),
+        skills=_from_dict(SkillConfig, merged.get("skills")),
+        mcp=_mcp_config_from_dict(merged.get("mcp")),
     )
     config.validate()
 
@@ -333,7 +544,13 @@ __all__ = [
     "AppConfig",
     "ConfigError",
     "LLMConfig",
+    "MCPConfig",
+    "MCPServerEntry",
+    "MCP_TRANSPORTS",
     "SessionConfig",
+    "SKILL_UNMATCHED_POLICIES",
+    "SkillConfig",
+    "TOOL_SOURCES",
     "TokenBudget",
     "TokenUsageConfig",
     "load_config",

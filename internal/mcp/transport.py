@@ -41,6 +41,9 @@ class MCPTransport(Protocol):
     def send(self, request: MCPRequest) -> MCPResponse:
         ...
 
+    def notify(self, request: MCPRequest) -> None:
+        ...
+
     def close(self) -> None:
         ...
 
@@ -173,6 +176,32 @@ class MCPStdioTransport:
                 f"MCP request {request.id!r} completed without a response"
             )
         return pending.response
+
+    def notify(self, request: MCPRequest) -> None:
+        """Send a JSON-RPC notification without waiting for a response."""
+        if not self.running:
+            raise MCPTransportError(
+                f"MCP stdio transport '{self.alias}' is not running"
+            )
+
+        payload = json.dumps(
+            request.to_dict(),
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+        process = self._process
+        if process is None or process.stdin is None:
+            raise MCPProcessExitedError(
+                f"MCP server '{self.alias}' has no writable stdin"
+            )
+        try:
+            with self._write_lock:
+                process.stdin.write(payload + "\n")
+                process.stdin.flush()
+        except (BrokenPipeError, OSError, ValueError) as exc:
+            raise MCPProcessExitedError(
+                f"MCP server '{self.alias}' closed stdin"
+            ) from exc
 
     def close(self) -> None:
         with self._state_lock:
@@ -315,6 +344,87 @@ class MCPHttpTransport:
                 return self._post(cached_endpoint, request)
             return self._resolve_and_post(request)
 
+    def notify(self, request: MCPRequest) -> None:
+        """Send a JSON-RPC notification over HTTP, ignoring the response body."""
+        if not self._started or self._closed:
+            raise MCPTransportError(
+                f"MCP HTTP transport '{self.alias}' is not running"
+            )
+
+        with self._endpoint_lock:
+            cached_endpoint = self.resolved_endpoint
+        if cached_endpoint is not None:
+            self._post_notification(cached_endpoint, request)
+            return
+
+        with self._resolution_lock:
+            with self._endpoint_lock:
+                cached_endpoint = self.resolved_endpoint
+            if cached_endpoint is not None:
+                self._post_notification(cached_endpoint, request)
+                return
+            for index, endpoint in enumerate(self._candidate_endpoints()):
+                try:
+                    self._post_notification(endpoint, request)
+                except urlerror.HTTPError as exc:
+                    if index == 0 and exc.code in {404, 405}:
+                        exc.close()
+                        continue
+                    try:
+                        transport_error = self._http_error(endpoint, exc)
+                    finally:
+                        exc.close()
+                    raise transport_error from exc
+                except urlerror.URLError as exc:
+                    if index == 0 and self._is_connection_setup_error(exc):
+                        continue
+                    raise MCPTransportError(
+                        f"MCP HTTP request to '{endpoint}' failed: {exc.reason}"
+                    ) from exc
+                with self._endpoint_lock:
+                    self.resolved_endpoint = endpoint
+                return
+
+        raise MCPTransportError(
+            f"No usable HTTP endpoint for MCP server '{self.alias}'"
+        )
+
+    def _post_notification(self, endpoint: str, request: MCPRequest) -> None:
+        body = json.dumps(
+            request.to_dict(),
+            ensure_ascii=False,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        headers = {
+            "Content-Type": "application/json",
+            "Accept": "application/json, text/event-stream",
+        }
+        meta = request.params.get("_meta") or {}
+        if isinstance(meta, dict):
+            protocol_version = meta.get(
+                "io.modelcontextprotocol/protocolVersion"
+            )
+            if protocol_version:
+                headers["MCP-Protocol-Version"] = str(protocol_version)
+        headers["Mcp-Method"] = request.method
+        headers.update(self.config.headers)
+        http_request = urlrequest.Request(
+            endpoint,
+            data=body,
+            headers=headers,
+            method="POST",
+        )
+        try:
+            response = urlrequest.urlopen(
+                http_request,
+                timeout=self.config.timeout_seconds,
+            )
+        except socket.timeout as exc:
+            raise MCPTimeoutError(
+                f"MCP HTTP request to '{endpoint}' timed out"
+            ) from exc
+        response.close()
+
     def close(self) -> None:
         self._closed = True
         self._started = False
@@ -408,7 +518,9 @@ class MCPHttpTransport:
             content_type = response.headers.get("Content-Type", "")
             if content_type.lower().startswith("text/event-stream"):
                 raise MCPProtocolError(
-                    "SSE responses are not supported by this MCP transport yet"
+                    f"MCP HTTP endpoint '{endpoint}' replied with "
+                    "text/event-stream (SSE), which this transport does not "
+                    "support yet. Use a stdio MCP server instead."
                 )
             raw = response.read()
 

@@ -1,10 +1,14 @@
 llm:
-  provider: dashscope
-  api_base: "https://dashscope.aliyuncs.com/compatible-mode/v1"
-  model: "qwen3-32b"
-  api_key_env: "DASHSCOPE_API_KEY"
-  fallback_api_key_envs:
-    - "OPENAI_API_KEY"
+  provider: deepseek
+  api_base: "https://api.deepseek.com/v1"
+  # "deepseek-v4-flash" is an alias the server resolves to "deepseek-flash"
+  # (the canonical name reported by /v1/models). Swap to the canonical form
+  # if the alias ever stops resolving.
+  model: "deepseek-v4-flash"
+  api_key_env: "DEEPSEEK_API_KEY"
+  # Keep this empty unless you have a genuinely interchangeable key: a
+  # fallback pointing at a different provider's key produces confusing 401s.
+  fallback_api_key_envs: []
   timeout_seconds: 180
   stream: true
 
@@ -20,3 +24,42 @@ token_usage:
 
 session:
   storage_dir: ".sessions"
+  default_id: "default"
+  isolate_tool_output: true
+
+skills:
+  enabled: true
+  dir: "skills"
+  inject_system_prompt: true
+  # none | readonly | all
+  # "none" gives the model no tools at all when no skill keyword matches, and
+  # it then hallucinates tool-call syntax as plain text. "readonly" keeps the
+  # read_*/list_* tools available so the model can still look around, while
+  # write_file / replace_line / run_shell still require a keyword match.
+  unmatched_tools: "readonly"
+  always_visible_sources:
+    - "mcp"
+
+mcp:
+  enabled: true
+  autostart: true
+  servers: []
+  # Example stdio server:
+  # servers:
+  #   - name: "filesystem"
+  #     transport: "stdio"
+  #     command: "npx"
+  #     args:
+  #       - "-y"
+  #       - "@modelcontextprotocol/server-filesystem"
+  #       - "."
+  #     env: {}
+  #     timeout_seconds: 60
+  #     enabled: true
+  # Example HTTP server:
+  #   - name: "remote"
+  #     transport: "http"
+  #     url: "http://127.0.0.1:8080/mcp"
+  #     headers: {}
+  #     timeout_seconds: 60
+  #     enabled: true

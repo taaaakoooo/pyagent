@@ -51,20 +51,26 @@ class MCPHttp:
 
 @dataclass(frozen=True)
 class MCPRequest:
-    """A JSON-RPC request sent to an MCP server."""
+    """A JSON-RPC request sent to an MCP server.
 
-    id: RequestId
+    ``id`` is ``None`` for notifications, which the JSON-RPC envelope must
+    omit entirely (for example ``notifications/initialized``).
+    """
+
     method: str
     params: Dict[str, Any] = field(default_factory=dict)
+    id: Optional[RequestId] = None
     jsonrpc: str = "2.0"
 
+    def is_notification(self) -> bool:
+        return self.id is None
+
     def to_dict(self) -> Dict[str, Any]:
-        return {
-            "jsonrpc": self.jsonrpc,
-            "id": self.id,
-            "method": self.method,
-            "params": self.params,
-        }
+        payload: Dict[str, Any] = {"jsonrpc": self.jsonrpc, "method": self.method}
+        if self.id is not None:
+            payload["id"] = self.id
+        payload["params"] = self.params
+        return payload
 
 
 @dataclass(frozen=True)

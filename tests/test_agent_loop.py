@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import tempfile
 import threading
 import unittest
 from pathlib import Path
@@ -24,6 +25,19 @@ from internal.types.types import (
     ToolDefinition,
     ToolResult,
 )
+
+
+def _files_skill_manager() -> SkillManager:
+    return SkillManager(
+        [
+            Skill(
+                name="files",
+                keywords=("文件",),
+                tools=("read_file", "write_file"),
+                instructions="Handle files.",
+            )
+        ]
+    )
 
 
 class AgentLoopTests(unittest.TestCase):
@@ -212,6 +226,7 @@ class AgentLoopTests(unittest.TestCase):
 
     def test_skills_hide_all_tools_when_no_keyword_matches(self) -> None:
         agent = self._make_agent()
+        agent.skill_unmatched_policy = "none"
         agent.skill_manager = SkillManager(
             [
                 Skill(
@@ -230,6 +245,40 @@ class AgentLoopTests(unittest.TestCase):
 
         self.assertEqual(stream.call_args.args[1], [])
         self.assertEqual(agent.state.metadata["active_skills"], [])
+
+    def test_default_policy_keeps_read_only_tools_when_no_keyword_matches(
+        self,
+    ) -> None:
+        """The default must not hand the model zero tools.
+
+        A zero-tool turn makes models emit tool-call syntax as plain text.
+        """
+        agent = self._make_agent()
+        agent.skill_manager = SkillManager(
+            [
+                Skill(
+                    name="shell",
+                    keywords=("命令",),
+                    tools=("run_shell",),
+                    instructions="Run commands carefully.",
+                )
+            ]
+        )
+        with mock.patch.object(agent, "run_loop", return_value="done"):
+            agent.chat("只回答一个问题")
+
+        with mock.patch.object(agent.client, "stream", return_value=[]) as stream:
+            agent._call_llm()
+
+        offered = {tool.name for tool in stream.call_args.args[1]}
+        self.assertEqual(
+            offered,
+            {"read_file", "list_dir", "read_regex", "read_disk_data"},
+        )
+        # Mutating tools still require a keyword match.
+        self.assertNotIn("run_shell", offered)
+        self.assertNotIn("write_file", offered)
+        self.assertNotIn("replace_line", offered)
 
     def test_skill_match_changes_between_chats_and_persists_within_loop(self) -> None:
         agent = self._make_agent()
@@ -275,6 +324,164 @@ class AgentLoopTests(unittest.TestCase):
             [tool.name for tool in stream.call_args.args[1]],
             [tool.name for tool in agent.tool_registry.list_tools()],
         )
+
+    def test_unmatched_policy_all_returns_every_tool(self) -> None:
+        agent = self._make_agent()
+        agent.skill_manager = _files_skill_manager()
+        agent.skill_unmatched_policy = "all"
+
+        with mock.patch.object(agent, "run_loop", return_value="done"):
+            agent.chat("no keyword here")
+
+        self.assertEqual(
+            [tool.name for tool in agent._visible_tools()],
+            [tool.name for tool in agent.tool_registry.list_tools()],
+        )
+        self.assertEqual(agent.state.metadata["active_skills"], [])
+
+    def test_unmatched_policy_readonly_keeps_only_read_tools(self) -> None:
+        agent = self._make_agent()
+        agent.skill_manager = _files_skill_manager()
+        agent.skill_unmatched_policy = "readonly"
+
+        with mock.patch.object(agent, "run_loop", return_value="done"):
+            agent.chat("no keyword here")
+
+        names = [tool.name for tool in agent._visible_tools()]
+        self.assertEqual(
+            names,
+            ["read_file", "list_dir", "read_regex", "read_disk_data"],
+        )
+        self.assertNotIn("write_file", names)
+        self.assertNotIn("run_shell", names)
+
+    def test_unmatched_policy_none_returns_no_tools(self) -> None:
+        agent = self._make_agent()
+        agent.skill_manager = _files_skill_manager()
+        agent.skill_unmatched_policy = "none"
+
+        with mock.patch.object(agent, "run_loop", return_value="done"):
+            agent.chat("no keyword here")
+
+        self.assertEqual(agent._visible_tools(), [])
+
+    def test_set_skills_enabled_false_restores_all_tools(self) -> None:
+        agent = self._make_agent()
+        agent.skill_manager = _files_skill_manager()
+        agent.skill_unmatched_policy = "none"
+
+        with mock.patch.object(agent, "run_loop", return_value="done"):
+            agent.chat("no keyword here")
+        self.assertEqual(agent._visible_tools(), [])
+
+        agent.set_skills_enabled(False)
+        self.assertEqual(agent.state.metadata["active_skills"], [])
+        self.assertEqual(
+            [tool.name for tool in agent._visible_tools()],
+            [tool.name for tool in agent.tool_registry.list_tools()],
+        )
+
+        agent.set_skills_enabled(True)
+        self.assertEqual(agent._visible_tools(), [])
+
+    def test_always_visible_sources_keeps_mcp_tools_under_policy_none(self) -> None:
+        agent = self._make_agent()
+        agent.tool_registry.register(
+            ToolDefinition(
+                name="read_file_1",
+                description="remote read",
+                input_schema={},
+                source="mcp",
+                server_name="fs",
+            ),
+            lambda arguments: ToolResult(
+                tool_call_id="", name="read_file_1", content=""
+            ),
+        )
+        agent.skill_manager = _files_skill_manager()
+        agent.skill_unmatched_policy = "none"
+
+        with mock.patch.object(agent, "run_loop", return_value="done"):
+            agent.chat("no keyword here")
+
+        self.assertEqual(
+            [tool.name for tool in agent._visible_tools()],
+            ["read_file_1"],
+        )
+
+    def test_always_visible_sources_survives_a_skill_match(self) -> None:
+        agent = self._make_agent()
+        agent.tool_registry.register(
+            ToolDefinition(
+                name="read_file_1",
+                description="remote read",
+                input_schema={},
+                source="mcp",
+                server_name="fs",
+            ),
+            lambda arguments: ToolResult(
+                tool_call_id="", name="read_file_1", content=""
+            ),
+        )
+        agent.skill_manager = _files_skill_manager()
+        agent.skill_unmatched_policy = "none"
+
+        with mock.patch.object(agent, "run_loop", return_value="done"):
+            agent.chat("文件")
+
+        names = [tool.name for tool in agent._visible_tools()]
+        self.assertEqual(names, ["read_file", "write_file", "read_file_1"])
+
+    def test_always_visible_sources_can_be_disabled(self) -> None:
+        agent = self._make_agent()
+        agent.always_visible_sources = ()
+        agent.skill_manager = _files_skill_manager()
+        agent.skill_unmatched_policy = "none"
+
+        with mock.patch.object(agent, "run_loop", return_value="done"):
+            agent.chat("no keyword here")
+
+        self.assertEqual(agent._visible_tools(), [])
+
+    def test_reload_skills_removes_stale_prompt_section(self) -> None:
+        agent = self._make_agent()
+        agent.system_prompt = "base prompt"
+        agent.messages = [Message(role="system", content="base prompt")]
+        agent.import_skills_to_system_prompt(
+            [Skill("files", ("文件",), ("read_file",), "Files policy.")]
+        )
+        self.assertIn("Skill: files", agent.system_prompt)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            skill_path = Path(tmp) / "shell.md"
+            skill_path.write_text(
+                "---\n"
+                "name: shell\n"
+                "keywords:\n"
+                "  - 命令\n"
+                "tools:\n"
+                "  - run_shell\n"
+                "---\n"
+                "Shell policy.\n",
+                encoding="utf-8",
+            )
+            agent.skill_manager = SkillManager()
+            agent.reload_skills(Path(tmp))
+            agent.import_skills_to_system_prompt()
+
+        self.assertIn("Skill: shell", agent.system_prompt)
+        self.assertNotIn("Skill: files", agent.system_prompt)
+        self.assertIn("base prompt", agent.system_prompt)
+
+    def test_describe_skills_reports_keywords_and_tools(self) -> None:
+        agent = self._make_agent()
+        agent.skill_manager = _files_skill_manager()
+
+        described = agent.describe_skills()
+        self.assertEqual(len(described), 1)
+        self.assertEqual(described[0]["name"], "files")
+        self.assertEqual(described[0]["keywords"], ["文件"])
+        self.assertEqual(described[0]["tools"], ["read_file", "write_file"])
 
     def _make_agent(self) -> Agent:
         token_budget = TokenBudget(TokenUsageConfig(context_window=128000))

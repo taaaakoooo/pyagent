@@ -3,28 +3,62 @@
 from __future__ import annotations
 
 import json
+import sys
 import uuid
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Dict, Iterable, List, Optional, Protocol, Sequence
+from typing import (
+    Any,
+    Callable,
+    Dict,
+    Iterable,
+    List,
+    Optional,
+    Protocol,
+    Sequence,
+    Tuple,
+)
 
-from config.config import AppConfig, AgentConfig, TokenBudget, load_config
+from config.config import (
+    AppConfig,
+    AgentConfig,
+    MCPConfig,
+    TokenBudget,
+    load_config,
+)
 from internal.compact.compact import (
     deterministic_compact,
     estimate_messages_tokens,
     should_force_compact,
 )
-from internal.llm.client import LLMClient, _merge_tool_call
+from internal.llm.client import LLMClient, LLMError, _merge_tool_call
+from internal.mcp.factory import build_mcp_manager_if_configured
 from internal.mcp.manager import MCPManager
 from internal.permission.permission import (
     PermissionCallback,
     create_default_permission_approver,
     enrich_permission_request,
+    is_read_only_tool,
 )
-from internal.skills import Skill, SkillManager, SkillMatch
+from internal.skills import (
+    Skill,
+    SkillError,
+    SkillLoadResult,
+    SkillManager,
+    SkillMatch,
+    discover_skill_files,
+    load_skill_markdown,
+)
+from internal.tools.executors import ToolContext
 from internal.tools.tools import create_default_tool_registry
-from internal.session.session import SessionStore
+from internal.session.session import (
+    SessionError,
+    SessionStore,
+    SessionSummary,
+    generate_session_id,
+    validate_session_id,
+)
 from internal.types.types import (
     AgentState,
     AgentStatus,
@@ -48,15 +82,41 @@ DEFAULT_SYSTEM_PROMPT = (
 DEFAULT_TOOL_OUTPUT_DIR = ".tool_outputs"
 
 
+def _resolve_skill_dir(value: str, workspace_root: Path) -> Path:
+    candidate = Path(value)
+    if not candidate.is_absolute():
+        candidate = workspace_root / candidate
+    return candidate
+
+
+def _safe_write(text: str, end: str = "\n") -> None:
+    """Write to stdout without ever dying on an un-encodable character.
+
+    The Windows console frequently runs a legacy code page (GBK here), so a
+    model reply containing an emoji would raise UnicodeEncodeError and abort
+    the whole turn. Fall back to a lossy encode instead.
+    """
+    stream = sys.stdout
+    try:
+        stream.write(text + end)
+    except UnicodeEncodeError:
+        encoding = getattr(stream, "encoding", None) or "utf-8"
+        stream.write(
+            text.encode(encoding, errors="replace").decode(encoding, errors="replace")
+            + end
+        )
+    stream.flush()
+
+
 def _default_stream_delta(delta: str) -> None:
-    print(delta, end="", flush=True)
+    _safe_write(delta, end="")
 
 
 def _default_tool_status(tool_name: str, status: str, details: Dict[str, Any]) -> None:
     detail_text = ""
     if details:
         detail_text = " " + " ".join(f"{key}={value}" for key, value in details.items())
-    print(f"\n[{tool_name}] {status}{detail_text}", flush=True)
+    _safe_write(f"\n[{tool_name}] {status}{detail_text}")
 
 
 def _default_permission_prompt(permission: PermissionRequest) -> PermissionDecision:
@@ -95,7 +155,13 @@ class ToolRegistryProtocol(Protocol):
 
 
 class PermissionApprover(Protocol):
-    """Component that decides whether a tool call is allowed."""
+    """Component that decides whether a tool call is allowed.
+
+    An approver may additionally implement ``reset_session() -> None`` to drop
+    any conversation-scoped decisions it is caching; ``Agent.switch_session``
+    calls it so grants cannot leak across sessions. It is optional, so this
+    Protocol deliberately does not declare it.
+    """
 
     def resolve(
         self,
@@ -130,10 +196,19 @@ class Agent:
     state: AgentState = field(default_factory=AgentState)
     token_budget: Optional[TokenBudget] = None
     session_store: Optional[SessionStore] = None
+    session_id: str = "default"
+    session_storage_dir: Optional[Path] = None
+    tool_output_root: Optional[Path] = None
     restored_message_count: int = 0
     mcp_manager: Optional[MCPManager] = None
     skill_manager: Optional[SkillManager] = None
+    skill_unmatched_policy: str = "readonly"
+    always_visible_sources: Tuple[str, ...] = ("mcp",)
+    skills_directory: Optional[Path] = None
+    _skills_enabled: bool = field(default=True, init=False)
+    _base_system_prompt: str = field(default="", init=False)
     _active_skill_match: Optional[SkillMatch] = field(default=None, init=False)
+    _cancel_requested: bool = field(default=False, init=False, repr=False)
 
     def __post_init__(self) -> None:
         if self.state.max_turns != self.config.max_turns:
@@ -217,6 +292,9 @@ class Agent:
             return
         if not self.system_prompt:
             return
+        if self.session_store is not None and not self.session_store.is_empty():
+            self.messages.insert(0, Message(role="system", content=self.system_prompt))
+            return
         system_message = Message(role="system", content=self.system_prompt)
         self.messages.insert(0, system_message)
         self._persist_message(system_message)
@@ -224,8 +302,93 @@ class Agent:
     def _has_system_message(self) -> bool:
         return any(message.role == "system" for message in self.messages)
 
+    def create_session(self, session_id: Optional[str] = None) -> str:
+        """Create a new empty session and switch to it."""
+        target = validate_session_id(session_id or generate_session_id())
+        if self.session_storage_dir is not None:
+            existing = {summary.session_id for summary in self.list_sessions()}
+            if target in existing:
+                suffix = 2
+                while f"{target}-{suffix}" in existing:
+                    suffix += 1
+                target = f"{target}-{suffix}"
+        self.switch_session(target)
+        return target
+
+    def switch_session(self, session_id: str) -> bool:
+        """Point the agent at another session, restoring its history."""
+        target = validate_session_id(session_id)
+        if target == self.session_id and self.session_store is not None:
+            return self.restored_message_count >= 1
+        if self.session_storage_dir is None:
+            raise SessionError("Agent has no session storage directory configured")
+
+        # Grants are keyed by tool name only, so leaving them in place would let
+        # an "always allow run_shell" from one session silently authorize the
+        # same tool in the next one. This guard sits after the same-session
+        # early return above, so re-selecting the active session is a no-op.
+        self._reset_permission_session()
+
+        store = SessionStore(self.session_storage_dir, target)
+        self.session_store = store
+        self.session_id = target
+        self.messages = []
+        self.restored_message_count = 0
+
+        if self.tool_output_root is not None:
+            self.tool_output_path = self.tool_output_root / target
+            self.tool_output_path.mkdir(parents=True, exist_ok=True)
+            self._rebind_tool_context()
+
+        loaded = store.load_messages()
+        self.messages = loaded
+        self.restored_message_count = len(loaded)
+        self._ensure_system_prompt()
+        if self.skill_manager:
+            self.import_skills_to_system_prompt()
+        self.update_estimated_tokens(self._estimate_context_tokens())
+        return self.restored_message_count >= 1
+
+    def list_sessions(self) -> List[SessionSummary]:
+        """List sessions available in the current storage directory."""
+        if self.session_storage_dir is None:
+            return []
+        return SessionStore.list_sessions(self.session_storage_dir)
+
+    def delete_session(self, session_id: str) -> bool:
+        """Delete a session file, refusing to delete the active session."""
+        target = validate_session_id(session_id)
+        if target == self.session_id:
+            raise SessionError("Cannot delete the active session")
+        if self.session_storage_dir is None:
+            raise SessionError("Agent has no session storage directory configured")
+        return SessionStore(self.session_storage_dir, target).delete()
+
+    def _reset_permission_session(self) -> None:
+        """Drop conversation-scoped permission decisions, if the approver keeps any.
+
+        ``reset_session`` is optional: ``PermissionApprover`` only requires
+        ``resolve``/``request``, so a custom approver without session state is
+        perfectly valid and simply needs no reset.
+        """
+        reset = getattr(self.permission, "reset_session", None)
+        if callable(reset):
+            reset()
+
+    def _rebind_tool_context(self) -> None:
+        set_context = getattr(self.tool_registry, "set_tool_context", None)
+        if not callable(set_context):
+            return
+        workspace_root = Path(self.config.workspace_root).resolve()
+        set_context(
+            ToolContext(
+                workspace_root=workspace_root,
+                tool_output_path=self.tool_output_path.resolve(),
+            )
+        )
+
     def _activate_skills(self, user_input: str) -> None:
-        if not self.skill_manager:
+        if not self._skills_enabled or not self.skill_manager:
             self._active_skill_match = None
             self.state.metadata["active_skills"] = []
             return
@@ -233,6 +396,150 @@ class Agent:
         self.state.metadata["active_skills"] = list(
             self._active_skill_match.skill_names
         )
+
+    def _visible_tools(self) -> List[ToolDefinition]:
+        """Tools exposed to the LLM for the current turn."""
+        tools = self.tool_registry.list_tools()
+        if not self._skills_enabled or not self.skill_manager:
+            return tools
+
+        pinned = [
+            tool
+            for tool in tools
+            if tool.source in self.always_visible_sources
+        ]
+        pinned_names = {tool.name for tool in pinned}
+
+        match = self._active_skill_match
+        if match is not None and match.tool_names:
+            allowed = set(match.tool_names)
+            return [
+                tool
+                for tool in tools
+                if tool.name in allowed or tool.source in self.always_visible_sources
+            ]
+
+        if self.skill_unmatched_policy == "all":
+            return tools
+        if self.skill_unmatched_policy == "readonly":
+            return pinned + [
+                tool
+                for tool in tools
+                if tool.name not in pinned_names
+                and is_read_only_tool(tool.name, tool.source)
+            ]
+        return pinned
+
+    def set_skills_enabled(self, enabled: bool) -> None:
+        """Toggle skill routing without discarding registered skills."""
+        self._skills_enabled = bool(enabled)
+        if not self._skills_enabled:
+            self._active_skill_match = None
+            self.state.metadata["active_skills"] = []
+
+    def describe_skills(self) -> List[Dict[str, Any]]:
+        """Summarize registered skills for display."""
+        if self.skill_manager is None:
+            return []
+        return [
+            {
+                "name": skill.name,
+                "description": skill.description,
+                "keywords": list(skill.keywords),
+                "tools": list(skill.tools),
+            }
+            for skill in self.skill_manager.list_skills()
+        ]
+
+    def reload_skills(self, directory: Optional[Path] = None) -> SkillLoadResult:
+        """Re-read skill files, keeping previously loaded skills on failure."""
+        if self.skill_manager is None:
+            self.skill_manager = SkillManager()
+        target = directory or self.skills_directory
+        if target is None:
+            return SkillLoadResult(
+                skills=tuple(self.skill_manager.list_skills()),
+                errors={},
+            )
+        return self.skill_manager.load_directory(Path(target))
+
+    def skills_enabled(self) -> bool:
+        """Whether skill-based tool routing is currently on."""
+        return self._skills_enabled
+
+    def describe_mcp(self) -> List[Dict[str, Any]]:
+        """Summarize every configured MCP server for display."""
+        if self.mcp_manager is None:
+            return []
+
+        errors = self.state.metadata.get("mcp_errors") or {}
+        routes = self.mcp_manager.list_tool_routes()
+        tools_by_server: Dict[str, List[str]] = {}
+        for route in routes:
+            tools_by_server.setdefault(route.server_alias, []).append(
+                route.public_name
+            )
+
+        servers: List[Dict[str, Any]] = []
+        for client in self.mcp_manager.list_clients():
+            alias = client.server_alias
+            error = errors.get(alias)
+            servers.append(
+                {
+                    "name": alias,
+                    "mode": client.mode,
+                    "enabled": client.enabled,
+                    "started": client.started,
+                    "tools": sorted(tools_by_server.get(alias, [])),
+                    "error": str(error) if error is not None else None,
+                }
+            )
+        return servers
+
+    def reload_mcp(self) -> Dict[str, BaseException]:
+        """Re-run discovery for every enabled MCP server."""
+        if self.mcp_manager is None:
+            return {}
+
+        failures = self.mcp_manager.start(self.tool_registry)
+        self.state.metadata["mcp_errors"] = {
+            alias: str(error) for alias, error in failures.items()
+        }
+        if self.skill_manager:
+            self.import_skills_to_system_prompt()
+        return failures
+
+    def set_mcp_server_enabled(self, server_alias: str, enabled: bool) -> bool:
+        """Toggle one MCP server; returns False when the alias is unknown."""
+        if self.mcp_manager is None:
+            return False
+        try:
+            self.mcp_manager.set_client_enabled(
+                server_alias,
+                enabled,
+                self.tool_registry,
+            )
+        except KeyError:
+            return False
+
+        if enabled:
+            self.reload_mcp()
+        else:
+            self.state.metadata["mcp_errors"] = {
+                alias: error
+                for alias, error in (
+                    self.state.metadata.get("mcp_errors") or {}
+                ).items()
+                if alias != server_alias
+            }
+            if self.skill_manager:
+                self.import_skills_to_system_prompt()
+        return True
+
+    def cancel(self) -> None:
+        """Request cancellation, honoured between agent loop turns."""
+        self._cancel_requested = True
+        self.state.status = AgentStatus.CANCELLED
 
     def import_skills_to_system_prompt(
         self,
@@ -253,13 +560,15 @@ class Agent:
             (message for message in self.messages if message.role == "system"),
             None,
         )
-        base_prompt = (
-            system_message.content
-            if system_message is not None and system_message.content is not None
-            else self.system_prompt
-        )
+        if not self._base_system_prompt:
+            content = (
+                system_message.content
+                if system_message is not None and system_message.content is not None
+                else self.system_prompt
+            )
+            self._base_system_prompt = content or ""
         self.system_prompt = self.skill_manager.merge_system_prompt(
-            base_prompt or "",
+            self._base_system_prompt,
             names,
         )
         if system_message is None:
@@ -281,13 +590,30 @@ class Agent:
     def run_loop(self) -> str:
         """Execute the agent loop until a final answer or turn limit."""
         self.state.turn = 0
+        self._cancel_requested = False
         final_answer: Optional[str] = None
 
         while self.state.turn < self.state.max_turns:
+            if self._cancel_requested:
+                self.state.status = AgentStatus.CANCELLED
+                self.state.last_error = "Cancelled by user"
+                return self.state.last_error
+
             self.state.turn += 1
             self._maybe_force_compact(self.state.turn)
 
-            response = self._call_llm()
+            try:
+                response = self._call_llm()
+            except LLMError as exc:
+                self.state.status = AgentStatus.ERROR
+                self.state.last_error = str(exc)
+                self.emit_tool_status(
+                    "llm",
+                    "error",
+                    {"message": str(exc)},
+                )
+                return self.state.last_error
+
             self._archive_llm_output(self.state.turn, response)
 
             if response.tool_calls:
@@ -303,6 +629,7 @@ class Agent:
 
         self.state.status = AgentStatus.ERROR
         self.state.last_error = f"Reached max turns ({self.state.max_turns})"
+        self.emit_tool_status("agent", "error", {"message": self.state.last_error})
         return self.state.last_error
 
     def _maybe_force_compact(self, turn: int) -> None:
@@ -319,14 +646,7 @@ class Agent:
             self._archive_cold_messages(turn, cold_messages)
 
     def _call_llm(self) -> LLMResponse:
-        tools = self.tool_registry.list_tools()
-        if self.skill_manager:
-            allowed_names = set(
-                self._active_skill_match.tool_names
-                if self._active_skill_match is not None
-                else ()
-            )
-            tools = [tool for tool in tools if tool.name in allowed_names]
+        tools = self._visible_tools()
         self.state.metadata["visible_tools"] = [tool.name for tool in tools]
         self.state.status = AgentStatus.STREAMING
         self.state.is_streaming = True
@@ -639,15 +959,23 @@ def create_agent(
     resolve_api_key: bool = True,
     restore_session: bool = True,
     mcp_manager: Optional[MCPManager] = None,
+    mcp_config: Optional[MCPConfig] = None,
     skills: Optional[Iterable[Skill]] = None,
     skill_files: Optional[Iterable[Path]] = None,
-    import_skills_into_system_prompt: bool = True,
+    import_skills_into_system_prompt: Optional[bool] = None,
+    session_id: Optional[str] = None,
 ) -> Agent:
     """Build an Agent with project defaults from config."""
     config = app_config or load_config(resolve_key=resolve_api_key)
     token_budget = TokenBudget(config.token_usage)
     workspace_root = Path(config.agent.workspace_root).resolve()
-    output_path = tool_output_path or (workspace_root / DEFAULT_TOOL_OUTPUT_DIR)
+    active_session = validate_session_id(session_id or config.session.default_id)
+
+    tool_output_root = tool_output_path or (workspace_root / DEFAULT_TOOL_OUTPUT_DIR)
+    if tool_output_path is None and config.session.isolate_tool_output:
+        output_path = tool_output_root / active_session
+    else:
+        output_path = tool_output_root
     output_path.mkdir(parents=True, exist_ok=True)
 
     prompt = DEFAULT_SYSTEM_PROMPT if system_prompt is None else system_prompt
@@ -656,14 +984,45 @@ def create_agent(
         tool_output_path=output_path,
     )
     mcp_errors: Dict[str, BaseException] = {}
+    if mcp_manager is None:
+        mcp_settings = mcp_config if mcp_config is not None else config.mcp
+        mcp_manager, _ = build_mcp_manager_if_configured(mcp_settings)
     if mcp_manager is not None:
         mcp_errors = mcp_manager.start(registry)
     approver = permission or create_default_permission_approver()
-    skill_manager = SkillManager(skills)
-    for skill_file in skill_files or ():
-        skill_manager.load_markdown(Path(skill_file))
 
-    session_store = SessionStore(Path(config.session.storage_dir))
+    skill_manager = SkillManager()
+    skill_errors: Dict[str, str] = {}
+    for skill in skills or ():
+        skill_manager.register(skill)
+    for skill_file in skill_files or ():
+        try:
+            skill_manager.replace(load_skill_markdown(Path(skill_file)))
+        except (SkillError, OSError) as exc:
+            skill_errors[str(skill_file)] = str(exc)
+
+    if not skills and not skill_files and config.skills.enabled:
+        load_result = skill_manager.load_directory(
+            _resolve_skill_dir(config.skills.dir, workspace_root)
+        )
+        skill_errors.update(load_result.errors)
+        for extra in config.skills.files:
+            try:
+                skill_manager.replace(load_skill_markdown(
+                    _resolve_skill_dir(extra, workspace_root)
+                ))
+            except (SkillError, OSError) as exc:
+                skill_errors[str(extra)] = str(exc)
+
+    if import_skills_into_system_prompt is None:
+        inject_prompt = config.skills.inject_system_prompt
+    else:
+        inject_prompt = import_skills_into_system_prompt
+
+    session_store = SessionStore(
+        Path(config.session.storage_dir),
+        active_session,
+    )
 
     agent = Agent(
         client=LLMClient(config.llm, token_budget),
@@ -681,18 +1040,26 @@ def create_agent(
         state=AgentState(max_turns=config.agent.max_turns),
         token_budget=token_budget,
         session_store=session_store,
+        session_id=active_session,
+        session_storage_dir=Path(config.session.storage_dir),
+        tool_output_root=tool_output_root,
         mcp_manager=mcp_manager,
         skill_manager=skill_manager,
+        skill_unmatched_policy=config.skills.unmatched_tools,
+        always_visible_sources=tuple(config.skills.always_visible_sources),
+        skills_directory=_resolve_skill_dir(config.skills.dir, workspace_root),
     )
     if mcp_errors:
         agent.state.metadata["mcp_errors"] = {
             alias: str(error) for alias, error in mcp_errors.items()
         }
+    if skill_errors:
+        agent.state.metadata["skill_errors"] = dict(skill_errors)
 
     restored = agent.restore_session() if restore_session else False
     if not restored:
         agent._ensure_system_prompt()
-    if import_skills_into_system_prompt and skill_manager:
+    if inject_prompt and skill_manager:
         agent.import_skills_to_system_prompt()
 
     return agent

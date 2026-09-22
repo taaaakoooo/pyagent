@@ -75,6 +75,18 @@ class SkillMatch:
         return tuple(skill.name for skill in self.skills)
 
 
+@dataclass(frozen=True)
+class SkillLoadResult:
+    """Outcome of loading one or more skill files."""
+
+    skills: Tuple[Skill, ...] = field(default_factory=tuple)
+    errors: Dict[str, str] = field(default_factory=dict)
+
+    @property
+    def skill_names(self) -> Tuple[str, ...]:
+        return tuple(skill.name for skill in self.skills)
+
+
 class SkillManager:
     """Ordered skill registry with deterministic keyword routing."""
 
@@ -90,8 +102,30 @@ class SkillManager:
         self._skills[skill.name] = skill
         return skill
 
+    def replace(self, skill: Skill) -> Skill:
+        """Register a skill, overwriting any existing skill with the same name."""
+        self._skills[skill.name] = skill
+        return skill
+
+    def unregister(self, name: str) -> bool:
+        return self._skills.pop(name, None) is not None
+
+    def clear(self) -> None:
+        self._skills.clear()
+
     def load_markdown(self, path: Path) -> Skill:
         return self.register(load_skill_markdown(path))
+
+    def load_directory(self, directory: Path) -> SkillLoadResult:
+        """Load every ``*.md`` skill in a directory, skipping broken files."""
+        loaded: List[Skill] = []
+        errors: Dict[str, str] = {}
+        for path in discover_skill_files(directory):
+            try:
+                loaded.append(self.replace(load_skill_markdown(path)))
+            except (SkillError, OSError) as exc:
+                errors[str(path)] = str(exc)
+        return SkillLoadResult(skills=tuple(loaded), errors=errors)
 
     def list_skills(self) -> List[Skill]:
         return list(self._skills.values())
@@ -126,15 +160,12 @@ class SkillManager:
         base_prompt: str,
         names: Optional[Sequence[str]] = None,
     ) -> str:
-        selected = [
-            skill
-            for skill in self._select(names)
-            if _prompt_marker(skill.name) not in base_prompt
-        ]
+        """Rebuild the prompt from its base, replacing any previous skill block."""
+        base = strip_skill_sections(base_prompt).rstrip()
+        selected = self._select(names)
         if not selected:
-            return base_prompt
+            return base
         addition = SkillManager(selected).render_prompt()
-        base = base_prompt.rstrip()
         return f"{base}\n\n# Imported Skills\n\n{addition}" if base else addition
 
     def _select(self, names: Optional[Sequence[str]]) -> List[Skill]:
@@ -154,6 +185,14 @@ class SkillManager:
 
     def __bool__(self) -> bool:
         return bool(self._skills)
+
+
+def discover_skill_files(directory: Path) -> List[Path]:
+    """Return every Markdown skill file in a directory, sorted by name."""
+    base = Path(directory)
+    if not base.is_dir():
+        return []
+    return sorted(base.glob("*.md"))
 
 
 def load_skill_markdown(path: Path) -> Skill:
@@ -250,6 +289,19 @@ def _prompt_marker(name: str) -> str:
     return f"<!-- pyagent-skill:{name} -->"
 
 
+_SKILL_SECTION_RE = re.compile(
+    r"<!--\s*pyagent-skill:(?P<name>[^\s>]+)\s*-->.*?<!--\s*/pyagent-skill:(?P=name)\s*-->\s*",
+    re.S,
+)
+_IMPORTED_SKILLS_HEADING_RE = re.compile(r"# Imported Skills\s*")
+
+
+def strip_skill_sections(prompt: str) -> str:
+    """Remove previously injected skill sections and the Imported Skills heading."""
+    without_sections = _SKILL_SECTION_RE.sub("", prompt)
+    return _IMPORTED_SKILLS_HEADING_RE.sub("", without_sections).strip()
+
+
 def _parse_simple_front_matter(text: str, path: Path) -> Dict[str, Any]:
     """Parse the string/list YAML subset used by skill metadata."""
     result: Dict[str, Any] = {}
@@ -281,8 +333,11 @@ def _parse_simple_front_matter(text: str, path: Path) -> Dict[str, Any]:
 __all__ = [
     "Skill",
     "SkillError",
+    "SkillLoadResult",
     "SkillManager",
     "SkillMatch",
+    "discover_skill_files",
     "import_skills_to_system_prompt",
     "load_skill_markdown",
+    "strip_skill_sections",
 ]

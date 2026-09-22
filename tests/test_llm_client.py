@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import io
 import json
+import time
 import unittest
 import urllib.error
+import urllib.request
 from typing import Any, Dict, List
 from unittest import mock
 
@@ -73,7 +75,9 @@ class LLMClientTests(unittest.TestCase):
             [Message(role="user", content="hello")],
             [],
         )
-        self.assertEqual(body["tools"], [])
+        # The key must be omitted entirely: DashScope rejects an empty array
+        # with HTTP 400 "[] is too short - 'tools'".
+        self.assertNotIn("tools", body)
         self.assertNotIn("tool_choice", body)
 
     def test_stream_parses_content_deltas(self) -> None:
@@ -301,6 +305,84 @@ class LLMClientTests(unittest.TestCase):
 
         self.assertEqual(captured["accept"], "application/json")
         self.assertFalse(captured["body"]["stream"])
+
+
+class LLMHTTPErrorMessageTests(unittest.TestCase):
+    """Provider error bodies must reach the user, not just the status code."""
+
+    def test_api_message_is_extracted_from_the_body(self) -> None:
+        error = LLMHTTPError(
+            400,
+            "Bad Request",
+            '{"error":{"message":"[] is too short - \'tools\'",'
+            '"type":"invalid_request_error"}}',
+        )
+
+        self.assertEqual(error.api_message, "[] is too short - 'tools'")
+        self.assertIn("[] is too short", str(error))
+
+    def test_arrearage_account_error_is_surfaced(self) -> None:
+        error = LLMHTTPError(
+            400,
+            "Bad Request",
+            '{"error":{"message":"Access denied, please make sure your '
+            'account is in good standing.","type":"Arrearage",'
+            '"code":"Arrearage"}}',
+        )
+
+        self.assertIn("account is in good standing", str(error))
+
+    def test_non_json_body_falls_back_to_raw_text(self) -> None:
+        error = LLMHTTPError(500, "Server Error", "upstream exploded")
+
+        self.assertEqual(error.api_message, "upstream exploded")
+
+    def test_empty_body_keeps_the_plain_message(self) -> None:
+        error = LLMHTTPError(503, "Unavailable")
+
+        self.assertEqual(error.api_message, "")
+        self.assertEqual(str(error), "HTTP 503: Unavailable")
+
+    def test_code_field_is_used_when_message_is_missing(self) -> None:
+        error = LLMHTTPError(
+            400, "Bad Request", '{"error":{"code":"InvalidParameter"}}'
+        )
+
+        self.assertEqual(error.api_message, "InvalidParameter")
+
+
+class NetworkRetryTests(unittest.TestCase):
+    """Transient socket failures must be retried, not surfaced immediately."""
+
+    def test_transient_url_error_is_retried_then_succeeds(self) -> None:
+        client = _make_client()
+        attempts: List[int] = []
+
+        def flaky_urlopen(request: object, timeout: float) -> object:
+            attempts.append(1)
+            if len(attempts) < 3:
+                raise urllib.error.URLError(OSError(2, "No such file or directory"))
+            return FakeHTTPResponse(b'data: {"choices":[{"delta":{"content":"ok"}}]}\n\n')
+
+        with mock.patch.object(urllib.request, "urlopen", side_effect=flaky_urlopen):
+            with mock.patch.object(time, "sleep", return_value=None):
+                response = client._request_with_retry({"a": 1}, "text/event-stream")
+
+        self.assertEqual(len(attempts), 3)
+        self.assertIsNotNone(response)
+
+    def test_persistent_url_error_raises_retry_exhausted(self) -> None:
+        client = _make_client()
+
+        def always_fail(request: object, timeout: float) -> object:
+            raise urllib.error.URLError(OSError(2, "No such file or directory"))
+
+        with mock.patch.object(urllib.request, "urlopen", side_effect=always_fail):
+            with mock.patch.object(time, "sleep", return_value=None):
+                with self.assertRaises(LLMRetryExhaustedError) as caught:
+                    client._request_with_retry({"a": 1}, "text/event-stream")
+
+        self.assertIn("Network error", str(caught.exception))
 
 
 if __name__ == "__main__":

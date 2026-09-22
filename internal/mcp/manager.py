@@ -83,10 +83,25 @@ class MCPManager:
             client.close()
         return client
 
+    def set_client_enabled(
+        self,
+        server_alias: str,
+        enabled: bool,
+        registry: Optional[ToolRegistry] = None,
+    ) -> MCPClient:
+        """Toggle a server; disabling also unregisters its public tools."""
+        client = self.get_client(server_alias)
+        client.enabled = bool(enabled)
+        if not enabled and registry is not None:
+            self._remove_stale_tools(server_alias, set(), registry)
+        return client
+
     def start_all(self) -> Dict[str, BaseException]:
         """Start all enabled clients and return failures keyed by alias."""
         failures: Dict[str, BaseException] = {}
         for client in self.list_clients():
+            if not client.enabled:
+                continue
             try:
                 client.start()
             except BaseException as exc:

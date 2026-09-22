@@ -10,8 +10,10 @@ from internal.skills import (
     Skill,
     SkillError,
     SkillManager,
+    discover_skill_files,
     import_skills_to_system_prompt,
     load_skill_markdown,
+    strip_skill_sections,
 )
 
 
@@ -117,6 +119,81 @@ class SkillTests(unittest.TestCase):
             manager.register(
                 Skill("same", ("two",), ("write_file",), "Second.")
             )
+
+    def test_discover_skill_files_sorts_and_handles_missing_dir(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            (directory / "b.md").write_text("x", encoding="utf-8")
+            (directory / "a.md").write_text("x", encoding="utf-8")
+            (directory / "notes.txt").write_text("x", encoding="utf-8")
+
+            found = discover_skill_files(directory)
+
+        self.assertEqual([path.name for path in found], ["a.md", "b.md"])
+        self.assertEqual(discover_skill_files(Path(tmp) / "missing"), [])
+
+    def test_load_directory_skips_broken_files(self) -> None:
+        manager = SkillManager()
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            (directory / "good.md").write_text(
+                "---\n"
+                "name: good\n"
+                "keywords:\n"
+                "  - good\n"
+                "tools:\n"
+                "  - read_file\n"
+                "---\n"
+                "Good instructions.\n",
+                encoding="utf-8",
+            )
+            (directory / "bad.md").write_text("# no front matter", encoding="utf-8")
+
+            result = manager.load_directory(directory)
+
+        self.assertEqual([skill.name for skill in result.skills], ["good"])
+        self.assertEqual(len(result.errors), 1)
+        self.assertIn("bad.md", next(iter(result.errors)))
+        self.assertEqual([skill.name for skill in manager.list_skills()], ["good"])
+
+    def test_unregister_replace_and_clear(self) -> None:
+        manager = SkillManager()
+        manager.register(Skill("alpha", ("one",), ("read_file",), "First."))
+
+        self.assertTrue(manager.unregister("alpha"))
+        self.assertFalse(manager.unregister("alpha"))
+        self.assertEqual(manager.list_skills(), [])
+
+        manager.replace(Skill("alpha", ("one",), ("read_file",), "First."))
+        manager.replace(Skill("alpha", ("two",), ("write_file",), "Second."))
+        self.assertEqual(len(manager.list_skills()), 1)
+        self.assertEqual(manager.list_skills()[0].instructions, "Second.")
+
+        manager.clear()
+        self.assertEqual(manager.list_skills(), [])
+
+    def test_strip_skill_sections_removes_injected_blocks(self) -> None:
+        skills = [
+            Skill("first", ("one",), ("read_file",), "First instructions."),
+            Skill("second", ("two",), ("write_file",), "Second instructions."),
+        ]
+        rendered = import_skills_to_system_prompt("Base.", skills)
+
+        stripped = strip_skill_sections(rendered)
+        self.assertEqual(stripped, "Base.")
+        self.assertNotIn("Imported Skills", stripped)
+        self.assertEqual(strip_skill_sections("plain text"), "plain text")
+
+    def test_reinjection_after_removal_leaves_no_residue(self) -> None:
+        first = Skill("first", ("one",), ("read_file",), "First instructions.")
+        second = Skill("second", ("two",), ("write_file",), "Second instructions.")
+
+        rendered = import_skills_to_system_prompt("Base.", [first, second])
+        rendered = import_skills_to_system_prompt(rendered, [first])
+
+        self.assertIn("Skill: first", rendered)
+        self.assertNotIn("Skill: second", rendered)
+        self.assertEqual(rendered.count("Imported Skills"), 1)
 
 
 if __name__ == "__main__":
